@@ -12,13 +12,23 @@ from jax import random
 import numpy as np
 import optax
 from datasets import load_dataset
-from tokenizers import Tokenizer
+from tokenizers import Tokenizer, models, pre_tokenizers, decoders, trainers
 
 import matplotlib.pyplot as plt
-from tqdm.notebook import tqdm
+from tqdm.auto import tqdm  # tqdm.notebook から tqdm.auto に変更
 
 import torch
 from safetensors.torch import save_file
+
+# -----------------------------
+# Google Drive マウント (Colabでの実行時)
+# -----------------------------
+try:
+    from google.colab import drive
+    drive.mount('/content/drive')
+except ImportError:
+    print("Google Colab環境ではないため、Driveのマウントをスキップします。")
+
 
 # -----------------------------
 # ロギング設定
@@ -42,7 +52,7 @@ def prepare_data(dataset_name: str = "wikimedia/wikipedia", config: str = "20231
         dataset = load_dataset(dataset_name, config, split=split, streaming=True)
         with open(output_path, "w", encoding="utf-8") as f:
             buffer = []
-            for i, item in enumerate(dataset):
+            for i, item in enumerate(tqdm(dataset, desc="データセット準備中")):
                 if item.get("text", "").strip():
                     sentences = item["text"].split("。 ")
                     np.random.shuffle(sentences)
@@ -91,41 +101,24 @@ def tokenize_to_memmap(
     tokenizer: Tokenizer,
     output_file: str = "tokens.memmap",
     block_size: int = 128,
-    chunk_size: int = 5000
+    chunk_size: int = 20000,
+    drive_path: Optional[str] = None
 ) -> np.memmap:
-    """
-    大規模テキストをチャンク単位でトークナイズし、memmapとして保存する。
-    2パス: (1) トークン数を概算 -> (2) memmapに書き込み
-    """
-    logging.info("First pass: counting total tokens...")
-    total_tokens = 0
-    buffer = []
-    with open(text_path, "r", encoding="utf-8") as f:
-        for i, line in enumerate(f):
-            line = line.strip()
-            if not line:
-                continue
-            buffer.append(line)
-            if (i + 1) % chunk_size == 0:
-                ids = tokenizer.encode(" ".join(buffer)).ids
-                total_tokens += len(ids)
-                buffer = []
-        if buffer:
-            ids = tokenizer.encode(" ".join(buffer)).ids
-            total_tokens += len(ids)
+    logging.info("Estimating total tokens...")
+    file_size = os.path.getsize(text_path)
+    estimated_tokens = int(file_size / 3 * 2)  # 日本語: 1文字≈3バイト、1トークン≈2~3文字
+    estimated_tokens = estimated_tokens - (estimated_tokens % block_size)
+    if estimated_tokens <= 0:
+        raise ValueError("Estimated token count is zero. Check input file.")
+    logging.info(f"Estimated tokens: {estimated_tokens:,}")
 
-    total_tokens = total_tokens - (total_tokens % block_size)
-    if total_tokens <= 0:
-        raise ValueError("No tokens produced. Check your input or tokenizer.")
-    logging.info(f"Total tokens (aligned to block_size={block_size}): {total_tokens:,}")
-
-    tokens = np.memmap(output_file, dtype=np.int32, mode="w+", shape=(total_tokens,))
-
-    logging.info("Second pass: writing tokens to memmap...")
+    tokens = np.memmap(output_file, dtype=np.int32, mode="w+", shape=(estimated_tokens,))
+    
+    logging.info("Writing tokens to memmap...")
     buffer = []
     offset = 0
-    with open(text_path, "r", encoding="utf-8") as f:
-        for i, line in enumerate(f):
+    with open(text_path, "r", encoding="utf-8", buffering=1024*1024) as f:
+        for i, line in enumerate(tqdm(f, desc="Tokenizing to memmap")):
             line = line.strip()
             if not line:
                 continue
@@ -133,21 +126,30 @@ def tokenize_to_memmap(
             if (i + 1) % chunk_size == 0:
                 ids = tokenizer.encode(" ".join(buffer)).ids
                 ids = ids[: len(ids) - (len(ids) % block_size)]
-                if offset + len(ids) > total_tokens:
-                    ids = ids[: total_tokens - offset]
+                if offset + len(ids) > estimated_tokens:
+                    ids = ids[: estimated_tokens - offset]
                 tokens[offset : offset + len(ids)] = ids
                 offset += len(ids)
                 buffer = []
-        if buffer and offset < total_tokens:
+        if buffer and offset < estimated_tokens:
             ids = tokenizer.encode(" ".join(buffer)).ids
             ids = ids[: len(ids) - (len(ids) % block_size)]
-            if offset + len(ids) > total_tokens:
-                ids = ids[: total_tokens - offset]
+            if offset + len(ids) > estimated_tokens:
+                ids = ids[: estimated_tokens - offset]
             tokens[offset : offset + len(ids)] = ids
             offset += len(ids)
-
+    
+    # トリミング
+    tokens = np.memmap(output_file, dtype=np.int32, mode="r+", shape=(offset,))
     tokens.flush()
-    logging.info(f"Tokenized dataset saved to {output_file}")
+    logging.info(f"Tokenized dataset saved to {output_file} with {offset:,} tokens")
+    
+    if drive_path:
+        import shutil
+        logging.info(f"Copying {output_file} to {drive_path}...")
+        shutil.copy(output_file, drive_path)
+        logging.info(f"Copied to {drive_path}")
+    
     return tokens
 
 # -----------------------------
@@ -189,9 +191,6 @@ def layer_norm(x: jnp.ndarray, scale: jnp.ndarray, bias: jnp.ndarray, eps: float
     return (x - mean) / jnp.sqrt(var + eps) * scale + bias
 
 def forward(params, x: jnp.ndarray, rng_key: jnp.ndarray, embed_size: int = 512, num_heads: int = 8, head_size: int = 64, dropout_rate: float = 0.05, training: bool = True, compute_dtype=jnp.bfloat16) -> jnp.ndarray:
-    """
-    1-GPU前提で jit する前提。内部演算は compute_dtype (bfloat16) で実施し、出力は float32 に変換。
-    """
     x = x.astype(jnp.int32)
     rng, dropout_rng = random.split(rng_key)
     embeddings = params["embed"][x].astype(compute_dtype)
@@ -241,9 +240,6 @@ def loss_fn(params, x: jnp.ndarray, y: jnp.ndarray, rng_key: jnp.ndarray, **fw_k
 # 6. データローダ（memmap） + GPUプリフェッチ
 # -----------------------------
 def batch_sampler_memmap(tokens: np.memmap, batch_size: int, block_size: int, n_batches: int, rng: np.random.RandomState, start: int, end: int):
-    """
-    memmap の指定範囲 [start, end) からランダムサンプリングしたバッチを n_batches 生成（CPU側）
-    """
     max_index = (end - start) - block_size - 1
     for _ in range(n_batches):
         idx = rng.randint(0, max_index, size=batch_size)
@@ -252,9 +248,6 @@ def batch_sampler_memmap(tokens: np.memmap, batch_size: int, block_size: int, n_
         yield X, Y
 
 def prefetch_to_device(generator, prefetch_size: int = 2):
-    """
-    CPU -> GPU への非同期プリフェッチ。単純なイテレータベース。
-    """
     queue = []
     for item in generator:
         item_dev = jax.tree_util.tree_map(jax.device_put, item)
@@ -317,14 +310,7 @@ def train_model_memmap(
     ckpt_every: int = 200,
     resume: bool = True,
 ):
-    """
-    - memmapからランダムサンプリング
-    - GPUへプリフェッチ
-    - bfloat16で計算（可）
-    - チェックポイント保存/再開
-    - 勾配蓄積（grad_accum_steps）
-    """
-    warmup_steps = min(2000, n_iterations // 2)  # Adjusted to ensure decay_steps > 0
+    warmup_steps = min(2000, n_iterations // 2)
     schedule = optax.join_schedules(
         [optax.linear_schedule(0.0, learning_rate, warmup_steps),
          optax.cosine_decay_schedule(learning_rate, n_iterations - warmup_steps, 0.5)],
@@ -339,13 +325,14 @@ def train_model_memmap(
     train_start, train_end = 0, train_size
     val_start, val_end = train_size, total_tokens
 
-    # JIT: update_step（勾配蓄積に対応）
     def loss_for_batch(p, bx, by, key):
-        return loss_fn(p, bx, by, key, compute_dtype=compute_dtype)
+        # **kwargsを loss_fn に渡すために block_size を除外する
+        fw_kwargs = {'compute_dtype': compute_dtype, 'dropout_rate': dropout_rate}
+        return loss_fn(p, bx, by, key, **fw_kwargs)
+
 
     @jax.jit
     def update_step(p, ostate, bxs, bys, key):
-        # bxs, bys: (grad_accum_steps, batch, seq)
         def step_carry(carry, inp):
             pi, ki, (bx, by) = carry
             loss, grads = jax.value_and_grad(loss_for_batch)(pi, bx, by, ki)
@@ -368,7 +355,8 @@ def train_model_memmap(
 
     @jax.jit
     def eval_loss(p, bx, by, key):
-        return loss_fn(p, bx, by, key, compute_dtype=compute_dtype)
+        fw_kwargs = {'compute_dtype': compute_dtype, 'training': False}
+        return loss_fn(p, bx, by, key, **fw_kwargs)
 
     train_losses, val_losses = [], []
     best_val = float("inf")
@@ -376,7 +364,6 @@ def train_model_memmap(
     patience_counter = 0
     start_iter = 0
 
-    # 再開
     if resume:
         last = latest_checkpoint(ckpt_dir)
         if last is not None:
@@ -388,25 +375,20 @@ def train_model_memmap(
             logging.info(f"Resumed from {last} (step={start_iter-1}, best_val={best_val:.4f})")
 
     rng_np = np.random.RandomState(0)
-    pbar = tqdm(range(start_iter, n_iterations), desc="Training Progress", ncols=120, mininterval=0.1, miniters=1)
+    pbar = tqdm(range(start_iter, n_iterations), desc="Training Progress", ncols=120, mininterval=1.0)
 
     for i in pbar:
-        # --- サンプル生成（CPU）
         gen = batch_sampler_memmap(tokens, batch_size, block_size, n_batches=grad_accum_steps, rng=rng_np, start=train_start, end=train_end)
-        # --- プリフェッチ -> デバイスに載せる
         batches = list(prefetch_to_device(gen, prefetch_size=2))
-        # バッチテンソルをスタック (T, B, L)
         bxs = jnp.stack([jnp.array(x) for x, _ in batches], axis=0)
         bys = jnp.stack([jnp.array(y) for _, y in batches], axis=0)
 
-        # --- 更新
         global rng_key
         rng_key, subkey = random.split(rng_key)
         params, opt_state, tr_loss = update_step(params, opt_state, bxs, bys, subkey)
         train_losses.append(float(tr_loss))
 
         if i % 50 == 0:
-            # validation
             vgen = batch_sampler_memmap(tokens, batch_size, block_size, n_batches=1, rng=rng_np, start=val_start, end=val_end)
             (vx, vy) = next(vgen)
             vx = jax.device_put(vx)
@@ -423,22 +405,21 @@ def train_model_memmap(
                 "Pat": f"{patience_counter}/{patience}",
             })
 
-            # checkpoint & early stopping
             improved = v_loss < best_val
             if improved:
                 best_val = v_loss
                 patience_counter = 0
+                save_checkpoint(ckpt_dir, i, params, opt_state, best_val, extra={"block_size": block_size})
             else:
                 patience_counter += 1
 
-            if (i % ckpt_every == 0) or improved:
-                save_checkpoint(ckpt_dir, i, params, opt_state, best_val, extra={"block_size": block_size})
+            if i > 0 and i % ckpt_every == 0:
+                 save_checkpoint(ckpt_dir, i, params, opt_state, best_val, extra={"block_size": block_size})
 
             if patience_counter >= patience:
                 logging.info(f"Early stopping at iteration {i}")
                 break
 
-    # 可視化
     if len(train_losses) > 0:
         plt.figure()
         plt.plot(range(len(train_losses)), train_losses, label="Train Loss")
@@ -463,10 +444,12 @@ def generate_text(params, tokenizer: Tokenizer, prompt: str, max_new_tokens: int
         tokens = jnp.array(tokens, dtype=jnp.int32).reshape(1, -1)
         pad_id = tokenizer.token_to_id("<|endoftext|>")
         eot_id = tokenizer.token_to_id("<|endoftext|>")
+        
+        fw_kwargs = {'compute_dtype': compute_dtype, 'training': False}
 
         for _ in range(max_new_tokens):
             rng_key, subkey = random.split(rng_key)
-            logits = forward(params, tokens, subkey, training=False, compute_dtype=compute_dtype)
+            logits = forward(params, tokens, subkey, **fw_kwargs)
             logits = logits[:, -1, :] / temperature
 
             top_k_logits, top_k_indices = jax.lax.top_k(logits, top_k)
@@ -503,6 +486,7 @@ def generate_text(params, tokenizer: Tokenizer, prompt: str, max_new_tokens: int
 # 10. GGUF エクスポート
 # -----------------------------
 def export_to_gguf(params, tokenizer: Tokenizer, output_dir: str = "model_gguf", quantization: str = "q8_0"):
+    # (この関数は元のコードから変更ありません)
     try:
         os.makedirs(output_dir, exist_ok=True)
 
@@ -522,7 +506,6 @@ def export_to_gguf(params, tokenizer: Tokenizer, output_dir: str = "model_gguf",
         save_file(state_dict, safetensors_path)
         tokenizer.save(os.path.join(output_dir, "tokenizer.json"))
 
-        # llama.cpp の convert.py を利用（事前にセットアップが必要）
         import subprocess
         convert_cmd = [
             "python", "llama.cpp/convert.py",
@@ -539,50 +522,108 @@ def export_to_gguf(params, tokenizer: Tokenizer, output_dir: str = "model_gguf",
         logging.error(f"Failed to export to GGUF: {e}")
         raise
 
-# -----------------------------
-# 11. メイン実行例
-# -----------------------------
+# ---------------------------------------------------
+# 11. メイン実行ブロック
+# ---------------------------------------------------
 if __name__ == "__main__":
-    block_size = 128
-    try:
-        # 1) データ準備
-        data_path = prepare_data(dataset_name="wikimedia/wikipedia", config="20231101.ja")
+    
+    # ▼▼▼ 実行モードを選択してください ▼▼▼
+    # "PREPROCESS": データ準備とトークン化を行い、Google Driveに保存します（初回のみ）。
+    # "TRAIN"     : 保存されたデータを使って学習を開始・再開します。
+    RUN_MODE = "PREPROCESS" 
+    # RUN_MODE = "TRAIN"
+    # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 
-        # 2) トークナイザー
-        tokenizer = load_pretrained_tokenizer("NousResearch/Llama-2-7b-hf")
+    # --- 共通設定 ---
+    DRIVE_BASE_DIR = "/content/drive/MyDrive/LLM_from_scratch"
+    TOKENIZER_NAME = "NousResearch/Llama-2-7b-hf"
+    BLOCK_SIZE = 128
+    
+    TOKENIZER_PATH = os.path.join(DRIVE_BASE_DIR, "tokenizer.json")
+    MEMMAP_PATH = os.path.join(DRIVE_BASE_DIR, "tokens.memmap")
+    CHECKPOINT_DIR = os.path.join(DRIVE_BASE_DIR, "checkpoints")
 
-        # 3) memmap 方式でトークナイズ（Google Drive 上に保存推奨）
-        tokens = tokenize_to_memmap(data_path, tokenizer, output_file="tokens.memmap", block_size=block_size)
+    # --- モードに応じた処理を実行 ---
+    if RUN_MODE == "PREPROCESS":
+        print(f"====== 前処理モードを開始します (最終出力先: {DRIVE_BASE_DIR}) ======")
+        try:
+            # --- 追加: ファイルコピー用のライブラリと一時的なローカルパスを定義 ---
+            import shutil
+            LOCAL_DATA_PATH = "/content/input.txt"
+            LOCAL_MEMMAP_PATH = "/content/tokens.memmap"
 
-        # 4) モデル
-        params = create_model(tokenizer.get_vocab_size(), embed_size=512, num_layers=6, head_size=64, block_size=block_size, param_dtype=jnp.bfloat16)
+            os.makedirs(DRIVE_BASE_DIR, exist_ok=True)
+            
+            print("\n--- 1. データ準備を開始します (高速なローカルディスク上) ---")
+            # 出力先を一時的なローカルパスに変更
+            data_path = prepare_data(output_path=LOCAL_DATA_PATH)
+            print(f"--- 1. データ準備が完了しました ---")
+            
+            print("\n--- 2. トークナイザーをロードし、Driveに保存します ---")
+            tokenizer = load_pretrained_tokenizer(TOKENIZER_NAME)
+            tokenizer.save(TOKENIZER_PATH)
+            print(f"--- 2. トークナイザーをロードし、{TOKENIZER_PATH} に保存しました ---")
+            
+            print("\n--- 3. memmapへのトークナイズを開始します（高速なローカルディスク上） ---")
+            # 出力先を一時的なローカルパスに変更
+            tokenize_to_memmap(data_path, tokenizer, output_file=LOCAL_MEMMAP_PATH, block_size=BLOCK_SIZE, chunk_size=20000, drive_path=MEMMAP_PATH)
+            print(f"--- 3. memmapへのトークナイズが完了しました ---")
+            
+            print("\n====== 前処理がすべて完了しました。RUN_MODEを'TRAIN'に変更して学習を開始してください ======")
 
-        # 5) 学習（GPU効率化 + チェックポイント保存・再開）
-        params = train_model_memmap(
-            params,
-            tokens,
-            batch_size=128,
-            n_iterations=2000,
-            learning_rate=3e-3,
-            block_size=block_size,
-            dropout_rate=0.05,
-            val_ratio=0.2,
-            grad_accum_steps=1,
-            compute_dtype=jnp.bfloat16,
-            ckpt_dir="checkpoints",
-            ckpt_every=200,
-            resume=True,
-        )
+        except Exception as e:
+            logging.error(f"前処理中にエラーが発生しました: {e}", exc_info=True)
+            raise
 
-        # 6) GGUF 出力（任意）
-        # export_to_gguf(params, tokenizer)
+    elif RUN_MODE == "TRAIN":
+        print(f"====== 学習モードを開始します (データ元: {DRIVE_BASE_DIR}) ======")
+        try:
+            print("\n--- 1. 保存済みファイルのロードを開始します ---")
+            if not os.path.exists(TOKENIZER_PATH) or not os.path.exists(MEMMAP_PATH):
+                raise FileNotFoundError("tokenizer.jsonまたはtokens.memmapが見つかりません。先にRUN_MODE='PREPROCESS'を実行してください。")
+            tokenizer = Tokenizer.from_file(TOKENIZER_PATH)
+            tokens = np.memmap(MEMMAP_PATH, dtype=np.int32, mode="r")
+            print(f"--- 1. トークナイザーと {len(tokens):,} 個のトークンをロードしました ---")
 
-        # 7) 生成テスト
-        prompt = "昔々あるところに"
-        generated = generate_text(params, tokenizer, prompt, block_size=block_size, top_k=40, top_p=0.9, temperature=0.9, compute_dtype=jnp.bfloat16)
-        print(f"Prompt: {prompt}")
-        print(f"Generated: {generated[:500]}")
+            print("\n--- 2. モデルを初期化します ---")
+            params = create_model(
+                tokenizer.get_vocab_size(), 
+                embed_size=512, 
+                num_layers=6, 
+                head_size=64, 
+                block_size=BLOCK_SIZE, 
+                param_dtype=jnp.bfloat16
+            )
+            print("--- 2. モデルの初期化が完了しました ---")
 
-    except Exception as e:
-        logging.error(f"Execution failed: {e}")
-        raise
+            print("\n--- 3. 学習を開始します（チェックポイントがあれば再開します） ---")
+            final_params = train_model_memmap(
+                params,
+                tokens,
+                batch_size=128,
+                n_iterations=5000, # 学習イテレーション数
+                learning_rate=3e-3,
+                block_size=BLOCK_SIZE,
+                dropout_rate=0.05,
+                val_ratio=0.1,
+                grad_accum_steps=1,
+                compute_dtype=jnp.bfloat16,
+                ckpt_dir=CHECKPOINT_DIR,
+                ckpt_every=200,
+                resume=True,
+            )
+            print("\n--- 3. 学習が完了しました ---")
+
+            print("\n--- 4. 生成テストを実行します ---")
+            prompt = "昔々あるところに"
+            generated = generate_text(final_params, tokenizer, prompt, block_size=BLOCK_SIZE)
+            print("-" * 50)
+            print(f"Prompt: {prompt}")
+            print(f"Generated: {generated[:500]}")
+            print("-" * 50)
+
+        except Exception as e:
+            logging.error(f"学習または生成中にエラーが発生しました: {e}", exc_info=True)
+            raise
+    else:
+        print(f"エラー: 無効なRUN_MODE '{RUN_MODE}' です。'PREPROCESS' または 'TRAIN' を指定してください。")
