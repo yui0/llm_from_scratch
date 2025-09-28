@@ -4,21 +4,20 @@ import os
 import re
 import pickle
 import logging
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, List
 
 import jax
 import jax.numpy as jnp
-from jax import random
+from jax import random, checkpoint
 import numpy as np
 import optax
-from datasets import load_dataset
-from tokenizers import Tokenizer, models, pre_tokenizers, decoders, trainers
-
+from datasets import load_dataset, concatenate_datasets
+from tokenizers import Tokenizer
 import matplotlib.pyplot as plt
-from tqdm.auto import tqdm  # tqdm.notebook から tqdm.auto に変更
-
+from tqdm.auto import tqdm
 import torch
 from safetensors.torch import save_file
+import shutil
 
 # -----------------------------
 # Google Drive マウント (Colabでの実行時)
@@ -29,7 +28,6 @@ try:
 except ImportError:
     print("Google Colab環境ではないため、Driveのマウントをスキップします。")
 
-
 # -----------------------------
 # ロギング設定
 # -----------------------------
@@ -38,33 +36,56 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 # 乱数シード
 rng_key = random.PRNGKey(0)
 
-# デバッグ（必要に応じて）
+# デバッグ
 jax.config.update("jax_debug_nans", False)
+
+# Enforce bfloat16 precision for matrix multiplications
+jax.config.update("jax_default_matmul_precision", "bfloat16")
 
 # -----------------------------
 # 1. データセットの準備（ストリーミング & 低メモリ）
 # -----------------------------
-def prepare_data(dataset_name: str = "wikimedia/wikipedia", config: str = "20231101.ja", split: str = "train", chunk_size: int = 1000, output_path: str = "input.txt"):
-    """
-    日本語Wikipediaをストリーミングで読み出し、チャンク単位でシャッフル/加工して input.txt に逐次保存。
-    """
+def prepare_data(
+    dataset_configs: List[Tuple[str, str]] = [("wikimedia/wikipedia", "20231101.ja")],
+    split: str = "train",
+    chunk_size: int = 1000,
+    output_path: str = "input.txt",
+    min_text_length: int = 100,
+    min_sentences: int = 2
+):
     try:
-        dataset = load_dataset(dataset_name, config, split=split, streaming=True)
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            logging.info(f"Dataset file already exists at {output_path} with size {os.path.getsize(output_path)} bytes. Skipping preparation.")
+            return output_path
+
+        datasets = []
+        for dataset_name, config in dataset_configs:
+            ds = load_dataset(dataset_name, config, split=split, streaming=True)
+            datasets.append(ds)
+
+        combined_dataset = concatenate_datasets(datasets) if len(datasets) > 1 else datasets[0]
+
         with open(output_path, "w", encoding="utf-8") as f:
             buffer = []
-            for i, item in enumerate(tqdm(dataset, desc="データセット準備中")):
-                if item.get("text", "").strip():
-                    sentences = item["text"].split("。 ")
+            total_written = 0
+            for i, item in enumerate(tqdm(combined_dataset, desc="データセット準備中")):
+                text = item.get("text", "").strip()
+                if len(text) > min_text_length and text.count("。") > min_sentences:
+                    sentences = text.split("。 ")
                     np.random.shuffle(sentences)
                     sentences = [s for s in sentences if np.random.random() > 0.05]
                     buffer.append("。 ".join(sentences))
 
                 if (i + 1) % chunk_size == 0:
                     f.write(" ".join(buffer) + " ")
+                    total_written += len(" ".join(buffer))
                     buffer = []
             if buffer:
                 f.write(" ".join(buffer))
-        logging.info(f"Dataset prepared in chunks and saved to {output_path}")
+                total_written += len(" ".join(buffer))
+        logging.info(f"Dataset prepared and saved to {output_path} with {total_written} characters")
+        if total_written == 0:
+            raise ValueError("No data written to output file. Check dataset or filtering criteria.")
         return output_path
     except Exception as e:
         logging.error(f"Failed to prepare dataset: {e}")
@@ -74,9 +95,6 @@ def prepare_data(dataset_name: str = "wikimedia/wikipedia", config: str = "20231
 # 2. トークナイザーのロード
 # -----------------------------
 def load_pretrained_tokenizer(model_name: str = "NousResearch/Llama-2-7b-hf") -> Tokenizer:
-    """
-    🤗 tokenizers の Tokenizer を読み込み。Colab環境ではHugging Face Hubの認証は任意（公開モデルに限る）。
-    """
     try:
         tokenizer = Tokenizer.from_pretrained(model_name)
         pad_token = "<|endoftext|>"
@@ -100,16 +118,25 @@ def tokenize_to_memmap(
     text_path: str,
     tokenizer: Tokenizer,
     output_file: str = "tokens.memmap",
-    block_size: int = 128,
-    chunk_size: int = 20000,
+    block_size: int = 32,
+    chunk_size: int = 10000,
     drive_path: Optional[str] = None
 ) -> np.memmap:
+    if os.path.exists(output_file):
+        logging.info(f"Memmap file already exists at {output_file}. Loading it.")
+        tokens = np.memmap(output_file, dtype=np.int32, mode="r+")
+        return tokens
+
     logging.info("Estimating total tokens...")
-    file_size = os.path.getsize(text_path)
-    estimated_tokens = int(file_size / 3 * 2)  # 日本語: 1文字≈3バイト、1トークン≈2~3文字
-    estimated_tokens = estimated_tokens - (estimated_tokens % block_size)
-    if estimated_tokens <= 0:
-        raise ValueError("Estimated token count is zero. Check input file.")
+    def estimate_tokens(sample_size: int = 10 * 1024 * 1024) -> int:
+        total_size = os.path.getsize(text_path)
+        with open(text_path, "r", encoding="utf-8") as f:
+            sample_text = f.read(sample_size)
+        sample_tokens = len(tokenizer.encode(sample_text).ids)
+        estimated_tokens = int(sample_tokens * (total_size / len(sample_text.encode('utf-8'))))
+        return estimated_tokens - (estimated_tokens % block_size)
+
+    estimated_tokens = estimate_tokens()
     logging.info(f"Estimated tokens: {estimated_tokens:,}")
 
     tokens = np.memmap(output_file, dtype=np.int32, mode="w+", shape=(estimated_tokens,))
@@ -117,7 +144,7 @@ def tokenize_to_memmap(
     logging.info("Writing tokens to memmap...")
     buffer = []
     offset = 0
-    with open(text_path, "r", encoding="utf-8", buffering=1024*1024) as f:
+    with open(text_path, "r", encoding="utf-8", buffering=4 * 1024 * 1024) as f:
         for i, line in enumerate(tqdm(f, desc="Tokenizing to memmap")):
             line = line.strip()
             if not line:
@@ -139,13 +166,11 @@ def tokenize_to_memmap(
             tokens[offset : offset + len(ids)] = ids
             offset += len(ids)
     
-    # トリミング
     tokens = np.memmap(output_file, dtype=np.int32, mode="r+", shape=(offset,))
     tokens.flush()
     logging.info(f"Tokenized dataset saved to {output_file} with {offset:,} tokens")
     
-    if drive_path:
-        import shutil
+    if drive_path and not os.path.exists(drive_path):
         logging.info(f"Copying {output_file} to {drive_path}...")
         shutil.copy(output_file, drive_path)
         logging.info(f"Copied to {drive_path}")
@@ -155,7 +180,7 @@ def tokenize_to_memmap(
 # -----------------------------
 # 4. モデル作成（シンプルTransformer）
 # -----------------------------
-def create_model(vocab_size: int, embed_size: int = 512, num_layers: int = 6, num_heads: int = 8, head_size: int = 64, block_size: int = 128, dropout_rate: float = 0.05, param_dtype=jnp.bfloat16):
+def create_model(vocab_size: int, embed_size: int = 512, num_layers: int = 6, num_heads: int = 8, head_size: int = 64, block_size: int = 32, dropout_rate: float = 0.1, param_dtype=jnp.bfloat16):
     def init_params(rng):
         params = {}
         def u(shape, scale):
@@ -178,9 +203,12 @@ def create_model(vocab_size: int, embed_size: int = 512, num_layers: int = 6, nu
                 "ffn2": u((embed_size * 4, embed_size), scale_f),
                 "ffn_norm": {"scale": jnp.ones(embed_size, dtype=param_dtype), "bias": jnp.zeros(embed_size, dtype=param_dtype)},
             }
+            logging.info(f"Layer {i} w_o shape: {params[f'layer_{i}']['w_o'].shape}")
         params["final"] = u((embed_size, vocab_size), scale_e)
+        logging.info(f"Embedding shape: {params['embed'].shape}, Final shape: {params['final'].shape}")
         return params
-    return init_params(random.split(rng_key)[0])
+    params = init_params(random.split(rng_key)[0])
+    return params
 
 # -----------------------------
 # 5. 前処理ユーティリティ
@@ -190,7 +218,7 @@ def layer_norm(x: jnp.ndarray, scale: jnp.ndarray, bias: jnp.ndarray, eps: float
     var = jnp.var(x, axis=-1, keepdims=True)
     return (x - mean) / jnp.sqrt(var + eps) * scale + bias
 
-def forward(params, x: jnp.ndarray, rng_key: jnp.ndarray, embed_size: int = 512, num_heads: int = 8, head_size: int = 64, dropout_rate: float = 0.05, training: bool = True, compute_dtype=jnp.bfloat16) -> jnp.ndarray:
+def forward(params, x: jnp.ndarray, rng_key: jnp.ndarray, embed_size: int = 512, num_heads: int = 8, head_size: int = 64, dropout_rate: float = 0.1, training: bool = True, compute_dtype=jnp.bfloat16) -> jnp.ndarray:
     x = x.astype(jnp.int32)
     rng, dropout_rng = random.split(rng_key)
     embeddings = params["embed"][x].astype(compute_dtype)
@@ -199,11 +227,10 @@ def forward(params, x: jnp.ndarray, rng_key: jnp.ndarray, embed_size: int = 512,
     seq_len = x.shape[-1]
     causal_mask = jnp.tril(jnp.ones((seq_len, seq_len), dtype=compute_dtype)).reshape(1, 1, seq_len, seq_len)
 
-    for i in range(len([k for k in params.keys() if k.startswith("layer_")])):
-        layer = params[f"layer_{i}"]
-        q = jnp.dot(embeddings, layer["w_q"]).reshape(-1, seq_len, num_heads, head_size)
-        k = jnp.dot(embeddings, layer["w_k"]).reshape(-1, seq_len, num_heads, head_size)
-        v = jnp.dot(embeddings, layer["w_v"]).reshape(-1, seq_len, num_heads, head_size)
+    def layer_fn(embeddings, layer_params, rng_key):
+        q = jnp.dot(embeddings, layer_params["w_q"]).reshape(-1, seq_len, num_heads, head_size)
+        k = jnp.dot(embeddings, layer_params["w_k"]).reshape(-1, seq_len, num_heads, head_size)
+        v = jnp.dot(embeddings, layer_params["w_v"]).reshape(-1, seq_len, num_heads, head_size)
 
         attn = jnp.einsum("bqhd,bkhd->bhqk", q, k) / jnp.sqrt(jnp.array(head_size, dtype=compute_dtype))
         attn = attn * causal_mask - 1e9 * (1 - causal_mask)
@@ -214,33 +241,42 @@ def forward(params, x: jnp.ndarray, rng_key: jnp.ndarray, embed_size: int = 512,
             attn = jnp.where(dropout_mask, attn / (1.0 - dropout_rate), 0.0)
 
         attn_out = jnp.einsum("bhqk,bkhd->bqhd", attn, v).reshape(-1, seq_len, num_heads * head_size)
-        embeddings = embeddings + jnp.dot(attn_out, layer["w_o"])
-        embeddings = layer_norm(embeddings, layer["attn_norm"]["scale"], layer["attn_norm"]["bias"])
+        embeddings = embeddings + jnp.dot(attn_out, layer_params["w_o"])
+        embeddings = layer_norm(embeddings, layer_params["attn_norm"]["scale"], layer_params["attn_norm"]["bias"])
 
-        ffn = jax.nn.relu(jnp.dot(embeddings, layer["ffn1"]))
-
+        ffn = jax.nn.relu(jnp.dot(embeddings, layer_params["ffn1"]))
         if training and dropout_rate > 0.0:
             dropout_mask = jax.random.bernoulli(dropout_rng, 1.0 - dropout_rate, ffn.shape)
             ffn = jnp.where(dropout_mask, ffn / (1.0 - dropout_rate), 0.0)
 
-        ffn = jnp.dot(ffn, layer["ffn2"])
+        ffn = jnp.dot(ffn, layer_params["ffn2"])
         embeddings = embeddings + ffn
-        embeddings = layer_norm(embeddings, layer["ffn_norm"]["scale"], layer["ffn_norm"]["bias"])
+        embeddings = layer_norm(embeddings, layer_params["ffn_norm"]["scale"], layer_params["ffn_norm"]["bias"])
+        return embeddings
+
+    for i in range(len([k for k in params.keys() if k.startswith("layer_")])):
+        layer = params[f"layer_{i}"]
+        embeddings = checkpoint(layer_fn)(embeddings, layer, dropout_rng)
 
     logits = jnp.dot(embeddings, params["final"]).astype(jnp.float32)
     return logits
 
 def loss_fn(params, x: jnp.ndarray, y: jnp.ndarray, rng_key: jnp.ndarray, **fw_kwargs) -> jnp.ndarray:
-    logits = forward(params, x, rng_key, training=True, **fw_kwargs)
+    logits = forward(params, x, rng_key, **fw_kwargs)
     log_probs = jax.nn.log_softmax(logits, axis=-1)
     targets = jax.nn.one_hot(y, logits.shape[-1])
     return -jnp.mean(jnp.sum(log_probs * targets, axis=-1))
+
+def perplexity(loss: float) -> float:
+    return jnp.exp(loss)
 
 # -----------------------------
 # 6. データローダ（memmap） + GPUプリフェッチ
 # -----------------------------
 def batch_sampler_memmap(tokens: np.memmap, batch_size: int, block_size: int, n_batches: int, rng: np.random.RandomState, start: int, end: int):
     max_index = (end - start) - block_size - 1
+    if max_index <= 0:
+        raise ValueError("Token array too small for batch sampling. Check token count or block size.")
     for _ in range(n_batches):
         idx = rng.randint(0, max_index, size=batch_size)
         X = np.stack([tokens[start + j : start + j + block_size] for j in idx]).astype(np.int32)
@@ -287,9 +323,16 @@ def latest_checkpoint(ckpt_dir: str) -> Optional[str]:
     files.sort()
     return os.path.join(ckpt_dir, files[-1])
 
-def load_checkpoint(path: str):
+def load_checkpoint(path: str, expected_embed_size: int = 512, expected_num_heads: int = 8, expected_head_size: int = 64):
     with open(path, "rb") as f:
         payload = pickle.load(f)
+    params = payload["params"]
+    for i in range(len([k for k in params.keys() if k.startswith("layer_")])):
+        w_o = params[f"layer_{i}"]["w_o"]
+        expected_w_o_shape = (expected_num_heads * expected_head_size, expected_embed_size)
+        if w_o.shape != expected_w_o_shape:
+            logging.error(f"Checkpoint w_o shape {w_o.shape} does not match expected {expected_w_o_shape}. Reinitializing model.")
+            raise ValueError(f"Incompatible checkpoint: w_o shape mismatch at layer {i}")
     return payload
 
 # -----------------------------
@@ -298,19 +341,18 @@ def load_checkpoint(path: str):
 def train_model_memmap(
     params,
     tokens: np.memmap,
-    batch_size: int = 128,
-    n_iterations: int = 15000,
+    batch_size: int = 32,
+    n_iterations: int = 20000,
     learning_rate: float = 1e-3,
-    block_size: int = 128,
-    dropout_rate: float = 0.05,
+    block_size: int = 32,
+    dropout_rate: float = 0.1,
     val_ratio: float = 0.2,
-    grad_accum_steps: int = 1,
+    grad_accum_steps: int = 8,
     compute_dtype=jnp.bfloat16,
     ckpt_dir: str = "checkpoints",
-    ckpt_every: int = 200,
-    resume: bool = True,
+    ckpt_every: int = 500,
 ):
-    warmup_steps = min(2000, n_iterations // 2)
+    warmup_steps = min(2000, n_iterations // 10)
     schedule = optax.join_schedules(
         [optax.linear_schedule(0.0, learning_rate, warmup_steps),
          optax.cosine_decay_schedule(learning_rate, n_iterations - warmup_steps, 0.5)],
@@ -326,20 +368,11 @@ def train_model_memmap(
     val_start, val_end = train_size, total_tokens
 
     def loss_for_batch(p, bx, by, key):
-        # **kwargsを loss_fn に渡すために block_size を除外する
         fw_kwargs = {'compute_dtype': compute_dtype, 'dropout_rate': dropout_rate}
         return loss_fn(p, bx, by, key, **fw_kwargs)
 
-
     @jax.jit
     def update_step(p, ostate, bxs, bys, key):
-        def step_carry(carry, inp):
-            pi, ki, (bx, by) = carry
-            loss, grads = jax.value_and_grad(loss_for_batch)(pi, bx, by, ki)
-            updates, new_ostate = optimizer.update(grads, ostate)
-            new_p = optax.apply_updates(pi, updates)
-            return (new_p, ki, (bx, by)), (loss, new_ostate)
-
         losses = []
         new_p = p
         new_ostate = ostate
@@ -364,15 +397,28 @@ def train_model_memmap(
     patience_counter = 0
     start_iter = 0
 
-    if resume:
-        last = latest_checkpoint(ckpt_dir)
-        if last is not None:
-            payload = load_checkpoint(last)
+    last = latest_checkpoint(ckpt_dir)
+    if last is not None:
+        try:
+            payload = load_checkpoint(last, embed_size=512, num_heads=8, head_size=64)
             params = jax.tree_util.tree_map(jnp.asarray, payload["params"])
             opt_state = jax.tree_util.tree_map(jnp.asarray, payload["opt_state"])
             best_val = float(payload.get("best_val", best_val))
             start_iter = int(payload.get("step", 0)) + 1
             logging.info(f"Resumed from {last} (step={start_iter-1}, best_val={best_val:.4f})")
+        except ValueError as e:
+            logging.warning(f"Failed to load checkpoint due to {e}. Starting with fresh parameters.")
+            params = create_model(
+                tokenizer.get_vocab_size(),
+                embed_size=512,
+                num_layers=6,
+                num_heads=8,
+                head_size=64,
+                block_size=block_size,
+                dropout_rate=dropout_rate,
+                param_dtype=jnp.bfloat16
+            )
+            opt_state = optimizer.init(params)
 
     rng_np = np.random.RandomState(0)
     pbar = tqdm(range(start_iter, n_iterations), desc="Training Progress", ncols=120, mininterval=1.0)
@@ -395,12 +441,14 @@ def train_model_memmap(
             vy = jax.device_put(vy)
             rng_key, subkey = random.split(rng_key)
             v_loss = float(eval_loss(params, vx, vy, subkey))
+            v_perp = perplexity(v_loss)
             val_losses.append(v_loss)
 
             pbar.set_postfix({
                 "Iter": i,
                 "TrainLoss": f"{float(tr_loss):.4f}",
                 "ValLoss": f"{v_loss:.4f}",
+                "ValPerp": f"{v_perp:.4f}",
                 "BestVal": f"{best_val:.4f}",
                 "Pat": f"{patience_counter}/{patience}",
             })
@@ -414,7 +462,7 @@ def train_model_memmap(
                 patience_counter += 1
 
             if i > 0 and i % ckpt_every == 0:
-                 save_checkpoint(ckpt_dir, i, params, opt_state, best_val, extra={"block_size": block_size})
+                save_checkpoint(ckpt_dir, i, params, opt_state, best_val, extra={"block_size": block_size})
 
             if patience_counter >= patience:
                 logging.info(f"Early stopping at iteration {i}")
@@ -434,16 +482,131 @@ def train_model_memmap(
     return params
 
 # -----------------------------
+# 8.5 Fine-Tuningループ（SFT用）
+# -----------------------------
+def fine_tune_model(
+    params,
+    tokenizer: Tokenizer,
+    dataset_name: str = "databricks/databricks-dolly-15k",
+    config: Optional[str] = None,
+    split: str = "train",
+    batch_size: int = 16,
+    n_iterations: int = 5000,
+    learning_rate: float = 5e-5,
+    block_size: int = 32,
+    dropout_rate: float = 0.05,
+    compute_dtype=jnp.bfloat16,
+    ckpt_dir: str = "fine_tune_checkpoints",
+    ckpt_every: int = 200,
+):
+    try:
+        dataset = load_dataset(dataset_name, config, split=split)
+    except Exception as e:
+        logging.error(f"Failed to load fine-tuning dataset: {e}")
+        raise
+
+    def preprocess(example):
+        prompt = example.get("instruction", "") + " " + example.get("context", "")
+        response = example.get("response", "")
+        eos_token = "<|endoftext|>"  # Use the same EOS token defined in load_pretrained_tokenizer
+        # Tokenize prompt and response separately
+        prompt_ids = tokenizer.encode(prompt).ids
+        response_ids = tokenizer.encode(response + eos_token).ids
+        
+        # Create input_ids and labels
+        input_ids = prompt_ids + response_ids
+        labels = [-100] * len(prompt_ids) + response_ids
+        
+        # Truncate to block_size if necessary
+        if len(input_ids) > block_size:
+            input_ids = input_ids[:block_size]
+            labels = labels[:block_size]
+        
+        # Pad to block_size
+        pad_length = block_size - len(input_ids)
+        input_ids += [tokenizer.token_to_id(eos_token)] * pad_length
+        labels += [-100] * pad_length
+        
+        logging.info(f"Processed example: input_ids length={len(input_ids)}, labels length={len(labels)}")
+        return {"input_ids": input_ids, "labels": labels}
+
+    dataset = dataset.map(preprocess, remove_columns=dataset.column_names)
+    dataset = dataset.with_format("jax")
+
+    warmup_steps = min(500, n_iterations // 10)
+    schedule = optax.join_schedules(
+        [optax.linear_schedule(0.0, learning_rate, warmup_steps),
+         optax.cosine_decay_schedule(learning_rate, n_iterations - warmup_steps, 0.1)],
+        [warmup_steps]
+    )
+    optimizer = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(schedule))
+    opt_state = optimizer.init(params)
+
+    def ft_loss_fn(p, inputs, labels, key):
+        logits = forward(p, inputs, key, training=True, compute_dtype=compute_dtype, dropout_rate=dropout_rate)
+        log_probs = jax.nn.log_softmax(logits, axis=-1)
+        mask = (labels != -100)
+        labels = jax.nn.one_hot(labels, logits.shape[-1])
+        loss = -jnp.sum(log_probs * labels, axis=-1)
+        loss = jnp.sum(loss * mask) / jnp.sum(mask)
+        return loss
+
+    @jax.jit
+    def update_step(p, ostate, inputs, labels, key):
+        loss, grads = jax.value_and_grad(ft_loss_fn)(p, inputs, labels, key)
+        updates, new_ostate = optimizer.update(grads, ostate, p)
+        new_p = optax.apply_updates(p, updates)
+        return new_p, new_ostate, loss
+
+    train_losses = []
+    start_iter = 0
+    last = latest_checkpoint(ckpt_dir)
+    if last:
+        try:
+            payload = load_checkpoint(last, embed_size=512, num_heads=8, head_size=64)
+            params = jax.tree_util.tree_map(jnp.asarray, payload["params"])
+            opt_state = jax.tree_util.tree_map(jnp.asarray, payload["opt_state"])
+            start_iter = payload["step"] + 1
+            logging.info(f"Resumed fine-tuning from {last} (step={start_iter})")
+        except ValueError as e:
+            logging.warning(f"Failed to load fine-tuning checkpoint due to {e}. Continuing with pretrained parameters.")
+            opt_state = optimizer.init(params)
+
+    pbar = tqdm(range(start_iter, n_iterations), desc="Fine-Tuning Progress")
+    dataset_size = len(dataset)
+    
+    for i in pbar:
+        batch_idx = (i * batch_size) % dataset_size
+        batch = dataset[batch_idx : batch_idx + batch_size]
+        # Ensure consistent shapes in the batch
+        input_ids = [batch["input_ids"][j] for j in range(len(batch["input_ids"]))]
+        labels = [batch["labels"][j] for j in range(len(batch["labels"]))]
+        
+        # Pad or truncate to ensure uniform shape
+        input_ids = jnp.array([x[:block_size] + [tokenizer.token_to_id("<|endoftext|>")] * (block_size - len(x[:block_size])) for x in input_ids])
+        labels = jnp.array([x[:block_size] + [-100] * (block_size - len(x[:block_size])) for x in labels])
+        
+        global rng_key
+        rng_key, subkey = random.split(rng_key)
+        params, opt_state, loss = update_step(params, opt_state, input_ids, labels, subkey)
+        train_losses.append(float(loss))
+        pbar.set_postfix({"Loss": f"{loss:.4f}"})
+
+        if i % ckpt_every == 0:
+            save_checkpoint(ckpt_dir, i, params, opt_state, loss)
+
+    return params
+
+# -----------------------------
 # 9. 文章生成
 # -----------------------------
-def generate_text(params, tokenizer: Tokenizer, prompt: str, max_new_tokens: int = 200, block_size: int = 128, top_k: int = 40, top_p: float = 0.9, temperature: float = 0.9, compute_dtype=jnp.bfloat16) -> str:
+def generate_text(params, tokenizer: Tokenizer, prompt: str, max_new_tokens: int = 200, block_size: int = 32, top_k: int = 40, top_p: float = 0.9, temperature: float = 0.7, compute_dtype=jnp.bfloat16) -> str:
     try:
-        rng_key = random.PRNGKey(0)
+        global rng_key
         tokens = tokenizer.encode(prompt).ids
         tokens = tokens[-block_size:]
         tokens = jnp.array(tokens, dtype=jnp.int32).reshape(1, -1)
         pad_id = tokenizer.token_to_id("<|endoftext|>")
-        eot_id = tokenizer.token_to_id("<|endoftext|>")
         
         fw_kwargs = {'compute_dtype': compute_dtype, 'training': False}
 
@@ -470,12 +633,12 @@ def generate_text(params, tokenizer: Tokenizer, prompt: str, max_new_tokens: int
 
             next_token = jax.random.choice(subkey, top_p_indices, p=top_p_probs)
 
-            if (pad_id is not None and int(next_token) == int(pad_id)) or (eot_id is not None and int(next_token) == int(eot_id)):
+            if pad_id is not None and int(next_token) == int(pad_id):
                 continue
             tokens = jnp.concatenate([tokens, jnp.array([[next_token]])], axis=1)
             tokens = tokens[:, -block_size:]
 
-        generated_text = tokenizer.decode([int(t) for t in tokens[0].tolist() if (pad_id is None or t != pad_id) and (eot_id is None or t != eot_id)])
+        generated_text = tokenizer.decode([int(t) for t in tokens[0].tolist() if pad_id is None or t != pad_id])
         logging.info(f"Generated text: {generated_text[:120]}...")
         return generated_text
     except Exception as e:
@@ -486,7 +649,6 @@ def generate_text(params, tokenizer: Tokenizer, prompt: str, max_new_tokens: int
 # 10. GGUF エクスポート
 # -----------------------------
 def export_to_gguf(params, tokenizer: Tokenizer, output_dir: str = "model_gguf", quantization: str = "q8_0"):
-    # (この関数は元のコードから変更ありません)
     try:
         os.makedirs(output_dir, exist_ok=True)
 
@@ -522,108 +684,119 @@ def export_to_gguf(params, tokenizer: Tokenizer, output_dir: str = "model_gguf",
         logging.error(f"Failed to export to GGUF: {e}")
         raise
 
-# ---------------------------------------------------
+# -----------------------------
 # 11. メイン実行ブロック
-# ---------------------------------------------------
+# -----------------------------
 if __name__ == "__main__":
     
-    # ▼▼▼ 実行モードを選択してください ▼▼▼
-    # "PREPROCESS": データ準備とトークン化を行い、Google Driveに保存します（初回のみ）。
-    # "TRAIN"     : 保存されたデータを使って学習を開始・再開します。
-    RUN_MODE = "PREPROCESS" 
-    # RUN_MODE = "TRAIN"
-    # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
-
     # --- 共通設定 ---
     DRIVE_BASE_DIR = "/content/drive/MyDrive/LLM_from_scratch"
     TOKENIZER_NAME = "NousResearch/Llama-2-7b-hf"
-    BLOCK_SIZE = 128
+    BLOCK_SIZE = 32
     
+    # ローカルとGoogle Driveのパスを定義
+    LOCAL_DATA_PATH = "input.txt"
+    LOCAL_MEMMAP_PATH = "tokens.memmap"
     TOKENIZER_PATH = os.path.join(DRIVE_BASE_DIR, "tokenizer.json")
     MEMMAP_PATH = os.path.join(DRIVE_BASE_DIR, "tokens.memmap")
     CHECKPOINT_DIR = os.path.join(DRIVE_BASE_DIR, "checkpoints")
+    FT_CHECKPOINT_DIR = os.path.join(DRIVE_BASE_DIR, "ft_checkpoints")
 
-    # --- モードに応じた処理を実行 ---
-    if RUN_MODE == "PREPROCESS":
-        print(f"====== 前処理モードを開始します (最終出力先: {DRIVE_BASE_DIR}) ======")
-        try:
-            # --- 追加: ファイルコピー用のライブラリと一時的なローカルパスを定義 ---
-            import shutil
-            LOCAL_DATA_PATH = "/content/input.txt"
-            LOCAL_MEMMAP_PATH = "/content/tokens.memmap"
+    # データとトークナイザーの準備
+    print("====== 前処理を開始します（ファイルが存在する場合はスキップ） ======")
+    os.makedirs(DRIVE_BASE_DIR, exist_ok=True)
+    
+    # データセットの準備（デフォルトWikipediaのみ、オプションで追加）
+    dataset_configs = [("wikimedia/wikipedia", "20231101.ja")]
+    try:
+        data_path = prepare_data(dataset_configs=dataset_configs, output_path=LOCAL_DATA_PATH, min_text_length=100, min_sentences=2)
+    except ValueError as e:
+        logging.error(f"Data preparation failed: {e}")
+        raise
 
-            os.makedirs(DRIVE_BASE_DIR, exist_ok=True)
-            
-            print("\n--- 1. データ準備を開始します (高速なローカルディスク上) ---")
-            # 出力先を一時的なローカルパスに変更
-            data_path = prepare_data(output_path=LOCAL_DATA_PATH)
-            print(f"--- 1. データ準備が完了しました ---")
-            
-            print("\n--- 2. トークナイザーをロードし、Driveに保存します ---")
-            tokenizer = load_pretrained_tokenizer(TOKENIZER_NAME)
-            tokenizer.save(TOKENIZER_PATH)
-            print(f"--- 2. トークナイザーをロードし、{TOKENIZER_PATH} に保存しました ---")
-            
-            print("\n--- 3. memmapへのトークナイズを開始します（高速なローカルディスク上） ---")
-            # 出力先を一時的なローカルパスに変更
-            tokenize_to_memmap(data_path, tokenizer, output_file=LOCAL_MEMMAP_PATH, block_size=BLOCK_SIZE, chunk_size=20000, drive_path=MEMMAP_PATH)
-            print(f"--- 3. memmapへのトークナイズが完了しました ---")
-            
-            print("\n====== 前処理がすべて完了しました。RUN_MODEを'TRAIN'に変更して学習を開始してください ======")
-
-        except Exception as e:
-            logging.error(f"前処理中にエラーが発生しました: {e}", exc_info=True)
-            raise
-
-    elif RUN_MODE == "TRAIN":
-        print(f"====== 学習モードを開始します (データ元: {DRIVE_BASE_DIR}) ======")
-        try:
-            print("\n--- 1. 保存済みファイルのロードを開始します ---")
-            if not os.path.exists(TOKENIZER_PATH) or not os.path.exists(MEMMAP_PATH):
-                raise FileNotFoundError("tokenizer.jsonまたはtokens.memmapが見つかりません。先にRUN_MODE='PREPROCESS'を実行してください。")
-            tokenizer = Tokenizer.from_file(TOKENIZER_PATH)
-            tokens = np.memmap(MEMMAP_PATH, dtype=np.int32, mode="r")
-            print(f"--- 1. トークナイザーと {len(tokens):,} 個のトークンをロードしました ---")
-
-            print("\n--- 2. モデルを初期化します ---")
-            params = create_model(
-                tokenizer.get_vocab_size(), 
-                embed_size=512, 
-                num_layers=6, 
-                head_size=64, 
-                block_size=BLOCK_SIZE, 
-                param_dtype=jnp.bfloat16
-            )
-            print("--- 2. モデルの初期化が完了しました ---")
-
-            print("\n--- 3. 学習を開始します（チェックポイントがあれば再開します） ---")
-            final_params = train_model_memmap(
-                params,
-                tokens,
-                batch_size=128,
-                n_iterations=5000, # 学習イテレーション数
-                learning_rate=3e-3,
-                block_size=BLOCK_SIZE,
-                dropout_rate=0.05,
-                val_ratio=0.1,
-                grad_accum_steps=1,
-                compute_dtype=jnp.bfloat16,
-                ckpt_dir=CHECKPOINT_DIR,
-                ckpt_every=200,
-                resume=True,
-            )
-            print("\n--- 3. 学習が完了しました ---")
-
-            print("\n--- 4. 生成テストを実行します ---")
-            prompt = "昔々あるところに"
-            generated = generate_text(final_params, tokenizer, prompt, block_size=BLOCK_SIZE)
-            print("-" * 50)
-            print(f"Prompt: {prompt}")
-            print(f"Generated: {generated[:500]}")
-            print("-" * 50)
-
-        except Exception as e:
-            logging.error(f"学習または生成中にエラーが発生しました: {e}", exc_info=True)
-            raise
+    if not os.path.exists(TOKENIZER_PATH):
+        tokenizer = load_pretrained_tokenizer(TOKENIZER_NAME)
+        tokenizer.save(TOKENIZER_PATH)
+        logging.info(f"Tokenizer saved to {TOKENIZER_PATH}")
     else:
-        print(f"エラー: 無効なRUN_MODE '{RUN_MODE}' です。'PREPROCESS' または 'TRAIN' を指定してください。")
+        tokenizer = Tokenizer.from_file(TOKENIZER_PATH)
+        logging.info(f"Tokenizer loaded from {TOKENIZER_PATH}")
+
+    # memmapへのトークナイズ
+    try:
+        tokens = tokenize_to_memmap(data_path, tokenizer, output_file=LOCAL_MEMMAP_PATH, block_size=BLOCK_SIZE, drive_path=MEMMAP_PATH)
+    except ValueError as e:
+        logging.error(f"Tokenization failed: {e}")
+        raise
+    
+    # チェックポイントディレクトリをクリア（オプション）
+    if os.path.exists(CHECKPOINT_DIR):
+        shutil.rmtree(CHECKPOINT_DIR)
+        logging.info(f"Cleared checkpoint directory {CHECKPOINT_DIR} to avoid dimension mismatches.")
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+
+    # ファインチューニングチェックポイントディレクトリをクリア（オプション）
+    if os.path.exists(FT_CHECKPOINT_DIR):
+        shutil.rmtree(FT_CHECKPOINT_DIR)
+        logging.info(f"Cleared fine-tuning checkpoint directory {FT_CHECKPOINT_DIR} to avoid dimension mismatches.")
+    os.makedirs(FT_CHECKPOINT_DIR, exist_ok=True)
+
+    print("====== 前処理が完了しました。学習を開始します ======")
+    try:
+        print("\n--- 2. モデルを初期化します ---")
+        params = create_model(
+            tokenizer.get_vocab_size(),
+            embed_size=512,
+            num_layers=6,
+            num_heads=8,
+            head_size=64,
+            block_size=BLOCK_SIZE,
+            param_dtype=jnp.bfloat16
+        )
+        print("--- 2. モデルの初期化が完了しました ---")
+
+        print("\n--- 3. Pretrainingを開始します（チェックポイントがあれば再開します） ---")
+        pretrain_params = train_model_memmap(
+            params,
+            tokens,
+            batch_size=32,
+            n_iterations=10000,
+            learning_rate=1e-3,
+            block_size=BLOCK_SIZE,
+            dropout_rate=0.1,
+            val_ratio=0.1,
+            grad_accum_steps=8,
+            compute_dtype=jnp.bfloat16,
+            ckpt_dir=CHECKPOINT_DIR,
+            ckpt_every=500,
+        )
+        print("\n--- 3. Pretrainingが完了しました ---")
+
+        #print("\n--- 3.5 Fine-Tuningを開始します ---")
+        #ft_params = fine_tune_model(
+            #pretrain_params,
+            #tokenizer,
+            #dataset_name="databricks/databricks-dolly-15k",
+            #batch_size=16,
+            #n_iterations=5000,
+            #learning_rate=5e-5,
+            #block_size=BLOCK_SIZE,
+            #dropout_rate=0.05,
+            #compute_dtype=jnp.bfloat16,
+            #ckpt_dir=FT_CHECKPOINT_DIR,
+            #ckpt_every=200,
+        #)
+        #print("\n--- 3.5 Fine-Tuningが完了しました ---")
+
+        print("\n--- 4. 生成テストを実行します ---")
+        prompt = "昔々あるところに"
+        #generated = generate_text(ft_params, tokenizer, prompt, block_size=BLOCK_SIZE, temperature=0.7)
+        generated = generate_text(pretrain_params, tokenizer, prompt, block_size=BLOCK_SIZE, temperature=0.7)
+        print("-" * 50)
+        print(f"Prompt: {prompt}")
+        print(f"Generated: {generated[:500]}")
+        print("-" * 50)
+
+    except Exception as e:
+        logging.error(f"学習または生成中にエラーが発生しました: {e}", exc_info=True)
+        raise
