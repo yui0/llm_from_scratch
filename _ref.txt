@@ -1,0 +1,22 @@
+Mounted at /content/drive
+====== 前処理を開始します（ファイルが存在する場合はスキップ） ======
+/usr/local/lib/python3.12/dist-packages/huggingface_hub/utils/_auth.py:94: UserWarning: 
+The secret `HF_TOKEN` does not exist in your Colab secrets.
+To authenticate with the Hugging Face Hub, create a token in your settings tab (https://huggingface.co/settings/tokens), set it as secret in your Google Colab and restart your session.
+You will be able to reuse this secret in all of your notebooks.
+Please note that authentication is recommended but still optional to access public models or datasets.
+  warnings.warn(
+README.md: 
+ 131k/? [00:00<00:00, 15.7MB/s]
+データセット準備中: 
+ 1389467/? [03:41<00:00, 7809.83it/s]
+Tokenizing to memmap: 
+ 75084073/? [40:14<00:00, 36803.77it/s]
+====== 前処理が完了しました。学習を開始します ======
+
+--- 2. モデルを初期化します ---
+--- 2. モデルの初期化が完了しました ---
+
+--- 3. Pretrainingを開始します（チェックポイントがあれば再開します） ---
+Training Progress:  51%
+ 10264/20000 [44:56<40:16,  4.03it/s, Iter=10250, TrainLoss=3.5046, ValLoss=3.4385, ValPerp=31.1412, BestVal=3.1696, Pat=42/800]
